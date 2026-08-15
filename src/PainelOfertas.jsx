@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { Unlock, ExternalLink, Check, Clock, RefreshCw, Tag, ShoppingBag } from "lucide-react";
+import { Unlock, ExternalLink, Check, Clock, RefreshCw, Tag, ShoppingBag, Trash2 } from "lucide-react";
 
 const SENHA_EDICAO = "Passada_Certa";
 
@@ -107,6 +107,15 @@ export default function PainelOfertas() {
     setOfertas(novaLista);
     await salvarOfertas(novaLista);
     mostrarToast(valor ? "Marcada como publicada." : "Desmarcada.");
+  }
+
+  async function deletarOferta(id) {
+    const novaLista = ofertas.filter((o) => o.id !== id);
+    const ok = await salvarOfertas(novaLista);
+    if (ok) {
+      setOfertas(novaLista);
+      mostrarToast("Oferta removida.");
+    }
   }
 
   // ------------------------------------------------------------
@@ -362,6 +371,15 @@ export default function PainelOfertas() {
                     style={{ background: "#1D6E4E" }}
                   >
                     {salvandoId === oferta.id ? "..." : "Salvar"}
+                  </button>
+                  <button
+                    onClick={() => deletarOferta(oferta.id)}
+                    className="px-3 py-2 rounded-xl text-sm font-medium text-white transition-opacity hover:opacity-90 flex-shrink-0"
+                    style={{ background: "#dc2626" }}
+                    title="Deletar oferta"
+                    aria-label="Deletar oferta"
+                  >
+                    <Trash2 size={16} />
                   </button>
                 </div>
 
