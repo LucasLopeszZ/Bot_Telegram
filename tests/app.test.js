@@ -1,0 +1,132 @@
+import {test,before,after,beforeEach} from 'node:test';
+import assert from 'node:assert/strict';
+import {PGlite} from '@electric-sql/pglite';
+import {Repository} from '../lib/db.js';
+import {normalize,canonical,formatPost,encrypt,decrypt,telegram,checkCoupon} from '../lib/core.js';
+import {createService,promobit,promobitDetail,priceValue} from '../lib/service.js';
+import {Meli} from '../lib/meli.js';
+let pg,repo;
+const env={APP_URL:'https://painel.example',ADMIN_PASSWORD:'senha-ficticia-para-testes',TOKEN_ENCRYPTION_KEY:'ab'.repeat(32),TELEGRAM_BOT_TOKEN:'fake',TELEGRAM_CHAT_ID:'fake',ENABLE_PUBLISH:'true',MELI_CLIENT_ID:'fake',MELI_CLIENT_SECRET:'fake',MELI_REDIRECT_URI:'https://painel.example/api/meli-callback'};
+const example=(more={})=>({titulo:'Tênis <Teste> & corrida',preco:'R$ 100,00',link_original:'https://example.org/oferta/1',link_afiliado:'',fonte:'promobit',...more});
+before(async()=>{pg=new PGlite();const db={query:async(sql,params)=>{if(!params&&sql.includes('CREATE TABLE'))return pg.exec(sql);const r=await pg.query(sql,params);return {rows:r.rows,rowCount:r.affectedRows??r.rows.length};}};db.connect=async()=>({...db,release(){}});repo=new Repository(db);await repo.init();});
+beforeEach(async()=>{await pg.exec('TRUNCATE pc_offers,pc_sessions,pc_tokens,pc_oauth,pc_rate,pc_locks');});
+after(async()=>{await pg.close();});
+async function approved(){await repo.add([example({fonte:'manual'})]);const [o]=await repo.list();await repo.edit({id:o.id,version:o.version,link_afiliado:'https://example.org/afiliado?a=1&b=2',action:'aprovar'});return (await repo.list())[0];}
+async function target(){const o=(await repo.list()).find(o=>o.estado==='aprovado');return {id:o?.id||'missing',version:o?.version||1};}
+function request(op,body,session){return {method:body?'POST':'GET',query:{op},body,headers:{origin:env.APP_URL,'content-type':'application/json',cookie:session?.cookie||'','x-csrf-token':session?.csrf||''}};}
+async function login(service){const r=await service.run(request('login',{password:env.ADMIN_PASSWORD}));return {cookie:r.cookie.split(';')[0],csrf:r.data.csrf};}
+test('deduplica links e a mesma coleta',async()=>{assert.equal(await repo.add([example(),example({link_original:'https://example.org/oferta/1/?utm_source=a#x'})]),1);assert.equal((await repo.list()).length,1);});
+test('não remove parâmetros funcionais',()=>assert.notEqual(canonical('https://example.org/?id=1'),canonical('https://example.org/?id=2')));
+test('deduplica Mercado Livre pelo anúncio',()=>assert.equal(normalize(example({fonte:'mercado_livre',external_id:'MLB123'})).id,normalize(example({fonte:'mercado_livre',external_id:'MLB123',link_original:'https://example.org/outro'})).id));
+test('importação antiga preserva publicadas e não aprova links',async()=>{await repo.add([example({publicado:true}),example({link_original:'https://example.org/2',link_afiliado:'https://example.org/af'})],true);const list=await repo.list();assert.equal(list.filter(o=>o.estado==='publicado').length,1);assert.equal(list.filter(o=>o.estado==='pendente').length,1);});
+test('importação inválida desfaz o lote',async()=>{await assert.rejects(()=>repo.add([example(),example({link_original:'javascript:alert(1)'})]));assert.equal((await repo.list()).length,0);});
+test('aprovação exige link de afiliado',async()=>{await repo.add([example()]);const [o]=await repo.list();await assert.rejects(()=>repo.edit({id:o.id,version:o.version,action:'aprovar'}),/afiliado/);});
+test('edição concorrente é rejeitada por versão',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,action:'salvar'});await assert.rejects(()=>repo.edit({id:o.id,version:o.version,action:'aprovar'}),/outra janela/);});
+test('reserva confirmada antes do envio e não pode ser repetida',async()=>{await approved();const claimed=await repo.claim();assert.ok(claimed.attempt);assert.equal(await repo.claim(),null);assert.equal((await repo.list())[0].estado,'enviando');});
+test('finalização exige a tentativa correta',async()=>{await approved();const claimed=await repo.claim();await repo.finish({...claimed,attempt:'errado'},{estado:'publicado'});assert.equal((await repo.list())[0].estado,'enviando');await repo.finish(claimed,{estado:'publicado',message_id:42});assert.equal((await repo.list())[0].message_id,42);});
+test('conferência não libera um envio recente',async()=>{await approved();const o=await repo.claim();await assert.rejects(()=>repo.reconcile({id:o.id,publicado:false,conferido_no_canal:true}),/5 minutos/);});
+test('envio incerto volta para revisão após conferência',async()=>{await approved();const o=await repo.claim();await repo.finish(o,{estado:'incerto'});await pg.query("UPDATE pc_offers SET claimed_at=now()-interval '6 minutes'");await repo.reconcile({id:o.id,publicado:false,conferido_no_canal:true});assert.equal((await repo.list())[0].estado,'pendente');assert.equal(await repo.claim(),null);});
+test('trava distribuída impede operação sobreposta',async()=>{await repo.lock('test',async()=>{await assert.rejects(()=>repo.lock('test',()=>{}),/andamento/);});assert.equal(await repo.lock('test',async()=>42),42);});
+test('escapa título e URL no Telegram',()=>{const text=formatPost(example({link_afiliado:'https://example.org/?a=1&b=2'}));assert.match(text,/&lt;Teste&gt; &amp;/);assert.match(text,/a=1&amp;b=2/);});
+test('tokens cifrados detectam adulteração',()=>{const c=encrypt({token:'secreto'},env.TOKEN_ENCRYPTION_KEY);assert.ok(!c.includes('secreto'));assert.deepEqual(decrypt(c,env.TOKEN_ENCRYPTION_KEY),{token:'secreto'});assert.throws(()=>decrypt(c,'cd'.repeat(32)));});
+test('timeout de Telegram é incerto e não repete POST',async()=>{let calls=0;const r=await telegram(example({link_afiliado:'https://example.org/a'}),env,async()=>{calls++;throw Error('timeout');});assert.equal(r.estado,'incerto');assert.equal(calls,1);});
+test('erro 429 exige nova revisão',async()=>{const r=await telegram(example({link_afiliado:'https://example.org/a'}),env,async()=>({ok:false,status:429,json:async()=>({ok:false})}));assert.equal(r.estado,'erro');});
+test('API não expõe ofertas sem sessão',async()=>{const service=createService(repo,env);await assert.rejects(()=>service.run(request('offers')),e=>e.status===401);});
+test('login protegido por origem e senha',async()=>{const service=createService(repo,env);const req=request('login',{password:env.ADMIN_PASSWORD});req.headers.origin='https://evil.example';await assert.rejects(()=>service.run(req),e=>e.status===403);await assert.rejects(()=>service.run(request('login',{password:'wrong'})),e=>e.status===401);const session=await login(service);assert.ok(session.csrf);});
+test('cookie de sessão é HttpOnly e Secure',async()=>{const service=createService(repo,env);const result=await service.run(request('login',{password:env.ADMIN_PASSWORD}));assert.match(result.cookie,/HttpOnly; Secure; SameSite=Lax/);});
+test('CSRF impede alterações de outra página',async()=>{const service=createService(repo,env),s=await login(service);const o=await approved();await assert.rejects(()=>service.run(request('edit',{id:o.id,version:o.version,action:'descartar'},{...s,csrf:'wrong'})),e=>e.status===403);});
+test('publicação confirmada não reenvia em chamada posterior',async()=>{await approved();let calls=0;const service=createService(repo,env,async()=>{calls++;return {ok:true,status:200,json:async()=>({ok:true,result:{message_id:99}})};});const s=await login(service);assert.equal((await service.run(request('publish',await target(),s))).data.estado,'publicado');await assert.rejects(()=>service.run(request('publish',{id:'missing',version:1},s)),e=>e.status===409);assert.equal(calls,1);});
+test('preview não envia mesmo com flag habilitada',async()=>{const service=createService(repo,{...env,VERCEL_ENV:'preview'});const s=await login(service);await assert.rejects(()=>service.run(request('publish',{id:'missing',version:1},s)),/prévias/);});
+test('OAuth vincula state à sessão e rejeita retorno adulterado',async()=>{const service=createService(repo,env),s=await login(service);const start=await service.run(request('meli-auth',{},s));const url=new URL(start.data.url);assert.equal(url.origin,'https://auth.mercadolivre.com.br');assert.equal(url.searchParams.get('code_challenge_method'),'S256');const req=request('meli-callback',undefined,s);req.query={op:'meli-callback',state:'wrong',code:'code'};await assert.rejects(()=>service.run(req),/inválida/);});
+test('Mercado Livre 403 é erro e não lista vazia',async()=>{await repo.db.query("INSERT INTO pc_tokens VALUES('meli',$1)",[encrypt({access_token:'fake',refresh_token:'fake',expires_at:Date.now()+100000},env.TOKEN_ENCRYPTION_KEY)]);const meli=new Meli(repo,env,async()=>({ok:false,status:403,json:async()=>({})}));await assert.rejects(()=>meli.collect('tenis'),/403/);});
+test('renovação persiste o novo refresh token',async()=>{await repo.db.query("INSERT INTO pc_tokens VALUES('meli',$1)",[encrypt({access_token:'old',refresh_token:'refresh-old',expires_at:0},env.TOKEN_ENCRYPTION_KEY)]);const meli=new Meli(repo,env,async()=>({ok:true,status:200,json:async()=>({access_token:'new',refresh_token:'refresh-new',expires_in:21600})}));assert.equal(await meli.token(),'new');const {rows:[r]}=await repo.db.query("SELECT value FROM pc_tokens WHERE id='meli'");assert.equal(decrypt(r.value,env.TOKEN_ENCRYPTION_KEY).refresh_token,'refresh-new');});
+const promoUrl='https://www.promobit.com.br/oferta/tenis-teste-123/';
+const product=(more={})=>({'@type':'Product',sku:123,name:'Tênis teste',image:['https://i.promobit.com.br/268/foto.png'],description:'<p>Use o cupom TESTE no Pix.</p>',offers:{price:100,priceCurrency:'BRL',availability:'https://schema.org/InStock',seller:{name:'Loja teste'}},...more});
+const detail=p=>'<main><h1>Tênis teste</h1></main><script type="application/ld+json">'+JSON.stringify(p)+'</script>';
+const home='<a href="'+promoUrl+'"><span class="line-clamp-2">Tênis teste</span></a>';
+test('coletor obtém preço, foto, vendedor e descrição do mesmo produto',async()=>{let calls=0;const offers=await promobit(async url=>({ok:true,text:async()=>{calls++;return url.endsWith('/123/')?'':url===promoUrl?detail(product()):home;}}));assert.equal(calls,2);assert.equal(priceValue(offers[0].preco),10000);assert.equal(offers[0].imagem,'https://i.promobit.com.br/268/foto.png');assert.equal(offers[0].review,'Informações da oferta: Use o cupom TESTE no Pix.');assert.equal(offers[0].link_afiliado,'');assert.equal(offers[0].link_original,promoUrl);});
+test('detalhe escolhe sku exato e não produto relacionado',async()=>{const r=await promobitDetail(promoUrl,async()=>({ok:true,text:async()=>detail([product({sku:999,name:'Outro'}),product()])}));assert.equal(r.titulo,'Tênis teste');});
+test('detalhe falha com produto errado ou oferta esgotada',async()=>{for(const p of [product({sku:999}),product({offers:{price:100,priceCurrency:'BRL',availability:'https://schema.org/OutOfStock'}})])await assert.rejects(()=>promobitDetail(promoUrl,async()=>({ok:true,text:async()=>detail(p)})),e=>e.status===409);});
+test('coletor não segue URL externa ou redirecionamento',async()=>{let calls=0;await assert.rejects(()=>promobitDetail('https://evil.example/oferta/tenis-123',()=>{calls++;}));assert.equal(calls,0);await promobitDetail(promoUrl,async(url,opts)=>{assert.equal(opts.redirect,'error');return {ok:true,text:async()=>detail(product())};});});
+test('campos indisponíveis não são inventados',async()=>{const r=await promobitDetail(promoUrl,async()=>({ok:true,text:async()=>detail(product({image:'http://127.0.0.1/foto',description:''}))}));assert.equal(r.imagem,'');assert.equal(r.review,'');assert.match(r.observacao,/indisponível/);});
+test('falha total de detalhes não parece uma coleta vazia bem sucedida',async()=>{await assert.rejects(()=>promobit(async url=>url===promoUrl?Promise.reject(Error('rede')):{ok:true,text:async()=>home}),/detalhes/);});
+test('cron de coleta exige segredo e nunca publica ou aprova',async()=>{let sends=0;const service=createService(repo,{...env,CRON_SECRET:'a'.repeat(32),VERCEL_ENV:'production'},async url=>{if(url.includes('telegram'))sends++;return {ok:true,text:async()=>url===promoUrl?detail(product()):home};});await assert.rejects(()=>service.run(request('collect-cron')),e=>e.status===401);const req=request('collect-cron');req.headers.authorization='Bearer '+'a'.repeat(32);const r=await service.run(req);assert.equal(r.data.adicionadas,1);assert.equal((await repo.list())[0].estado,'pendente');assert.equal(sends,0);assert.equal((await service.run(req)).data.adicionadas,0);});
+test('cron de coleta não funciona em preview',async()=>{const service=createService(repo,{...env,CRON_SECRET:'a'.repeat(32),VERCEL_ENV:'preview'});const req=request('collect-cron');req.headers.authorization='Bearer '+'a'.repeat(32);await assert.rejects(()=>service.run(req),e=>e.status===409);});
+test('mudança de preço devolve oferta para revisão sem Telegram',async()=>{await repo.add([example({link_original:promoUrl,preco:'R$ 90,00',link_afiliado:'https://example.org/a'})]);const [o]=await repo.list();await repo.edit({id:o.id,version:o.version,action:'aprovar'});let sends=0;const service=createService(repo,env,async url=>{if(url.includes('telegram'))sends++;return {ok:true,text:async()=>detail(product())};});const s=await login(service);assert.equal((await service.run(request('publish',await target(),s))).data.estado,'pendente');assert.equal(sends,0);assert.equal((await repo.list())[0].estado,'pendente');});
+test('coletor detecta HTML sem ofertas',async()=>{await assert.rejects(()=>promobit(async()=>({ok:true,text:async()=>'<h1>Loading</h1>'})),/mudou o HTML/);});
+
+test('foto e review são persistidos e publicados juntos sem segundo envio',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,imagem:'https://example.org/foto.jpg',review:'Mesh <leve> & respirável',action:'aprovar'});const [saved]=await repo.list();let calls=0;const r=await telegram(saved,env,async(url,opts)=>{calls++;assert.match(url,/\/sendPhoto$/);const p=JSON.parse(opts.body);assert.equal(p.photo,saved.imagem);assert.match(p.caption,/Mesh &lt;leve&gt; &amp; respirável/);assert.equal(p.text,undefined);return {ok:true,status:200,json:async()=>({ok:true,result:{message_id:123}})};});assert.equal(calls,1);assert.equal(r.message_id,123);});
+test('foto inválida e legenda longa bloqueiam aprovação',async()=>{const o=await approved();await assert.rejects(()=>repo.edit({id:o.id,version:o.version,imagem:'javascript:alert(1)',action:'aprovar'}),/Foto/);await assert.rejects(()=>repo.edit({id:o.id,version:o.version,imagem:'https://example.org/f.jpg',titulo:'T'.repeat(600),review:'R'.repeat(500),action:'aprovar'}),/1024/);});
+test('timeout de foto mantém estado incerto sem fallback duplicado',async()=>{let calls=0;const r=await telegram(example({imagem:'https://example.org/f.jpg',link_afiliado:'https://example.org/a'}),env,async()=>{calls++;throw Error('timeout');});assert.equal(r.estado,'incerto');assert.equal(calls,1);});
+test('cadastro manual exige sessão e salva pendente sem publicar',async()=>{const service=createService(repo,env,()=>{throw Error('não deve enviar');});await assert.rejects(()=>service.run(request('create',example())),e=>e.status===401);const s=await login(service);const r=await service.run(request('create',example({link_afiliado:'https://example.org/a',imagem:'https://example.org/f.jpg',review:'Descrição',publicado:true,estado:'aprovado'}),s));assert.equal(r.data.adicionadas,1);const [o]=await repo.list();assert.equal(o.estado,'pendente');assert.equal(o.fonte,'manual');assert.equal(o.review,'Descrição');});
+
+test('403 identifica recurso e não expõe resposta ou token',async()=>{const meli=new Meli({},env,async()=>({ok:false,status:403,json:async()=>({code:'PA_UNAUTHORIZED_RESULT_FROM_POLICIES',message:'segredo-do-provedor',access_token:'token-sensivel'})}));meli.token=async()=>'token-sensivel';await assert.rejects(()=>meli.get('/products/search',{q:'consulta-privada'}),e=>e.status===403&&e.message.includes('GET /products/search')&&e.message.includes('PA_UNAUTHORIZED_RESULT_FROM_POLICIES')&&!/segredo|sensivel|privada/.test(e.message));await assert.rejects(()=>meli.get('/products/MLB123/items'),e=>e.message.includes('/products/{id}/items'));});
+
+test('cupom persiste, escapa HTML e inclui validade de Brasília na mensagem',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,cupom:'TESTE<10>',cupom_condicoes:'Mínimo R$ 100 & limite R$ 20',cupom_validade:'2099-10-01T23:59',action:'aprovar'});const saved=(await repo.list())[0];assert.equal(saved.cupom,'TESTE<10>');assert.match(formatPost(saved),/TESTE&lt;10&gt;/);assert.match(formatPost(saved),/01\/10\/2099 às 23:59 \(Brasília\)/);assert.match(formatPost(saved),/&amp;/);});
+test('cupom exige validade ao aprovar e valida datas reais',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,cupom:'TESTE',action:'salvar'});const draft=(await repo.list())[0];await assert.rejects(()=>repo.edit({id:draft.id,version:draft.version,action:'aprovar'}),/validade/);assert.throws(()=>normalize(example({cupom_validade:'2099-02-30T10:00'})),/inválida/);assert.throws(()=>normalize(example({cupom_validade:'2099-10-01T25:00'})),/inválida/);});
+test('vencimento considera Brasília e bloqueia exatamente no horário informado',()=>{const c={cupom:'TESTE',cupom_validade:'2099-10-01T12:00'};assert.doesNotThrow(()=>checkCoupon(c,Date.parse('2099-10-01T14:59:59Z')));assert.throws(()=>checkCoupon(c,Date.parse('2099-10-01T15:00:00Z')),/vencido/);});
+test('cupom que vence após aprovação retorna para revisão sem chamar Telegram',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,cupom:'TESTE',cupom_validade:'2099-10-01T12:00',action:'aprovar'});await pg.query(`UPDATE pc_offers SET data=jsonb_set(data,'{cupom_validade}','"2000-01-01T12:00"') WHERE id=$1`,[o.id]);let calls=0;const service=createService(repo,env,async()=>{calls++;throw Error('não deve enviar');});const session=await login(service);const result=await service.run(request('publish',await target(),session));assert.equal(result.data.estado,'pendente');assert.equal(calls,0);assert.match((await repo.list())[0].erro,/vencido/);});
+test('descarte preserva cupom e deduplicação; restauração exige nova aprovação',async()=>{const o=await approved();await repo.edit({id:o.id,version:o.version,cupom:'TESTE',cupom_validade:'2000-01-01T12:00',action:'salvar'});let row=(await repo.list())[0];await repo.edit({id:row.id,version:row.version,action:'descartar'});row=(await repo.list())[0];assert.equal(row.estado,'descartado');assert.equal(await repo.add([example({fonte:'manual'})]),0);assert.equal(await repo.claim(),null);await repo.edit({id:row.id,version:row.version,action:'restaurar'});row=(await repo.list())[0];assert.equal(row.estado,'pendente');assert.equal(row.cupom,'TESTE');assert.equal(await repo.claim(),null);await assert.rejects(()=>repo.edit({id:row.id,version:row.version,action:'aprovar'}),/vencido/);});
+
+test('conferência manual permite envio com Promobit indisponível e é invalidada por edição',async()=>{await repo.add([example()]);let o=(await repo.list())[0];await repo.edit({id:o.id,version:o.version,link_afiliado:'https://example.org/af',preco_conferido:true,action:'aprovar'});o=(await repo.list())[0];assert.ok(o.preco_conferido_em);await repo.edit({id:o.id,version:o.version,action:'salvar'});o=(await repo.list())[0];assert.equal(o.preco_conferido_em,null);await repo.edit({id:o.id,version:o.version,preco_conferido:true,action:'aprovar'});let calls=0;const service=createService(repo,env,async url=>{calls++;assert.match(url,/api.telegram.org/);return {ok:true,json:async()=>({ok:true,result:{message_id:123}})};});const session=await login(service);assert.equal((await service.run(request('publish',await target(),session))).data.estado,'publicado');assert.equal(calls,1);});
+test('conferência expirada não contorna Promobit',async()=>{await repo.add([example()]);let o=(await repo.list())[0];await repo.edit({id:o.id,version:o.version,link_afiliado:'https://example.org/af',preco_conferido:true,action:'aprovar'});await pg.query("UPDATE pc_offers SET data=jsonb_set(data,'{preco_conferido_em}',$1::jsonb)",[JSON.stringify(Date.now()-16*60000)]);const service=createService(repo,env,async()=>{throw Error('indisponível');});const session=await login(service);assert.equal((await service.run(request('publish',await target(),session))).data.estado,'pendente');});
+
+
+test('publicação envia somente a oferta escolhida e rejeita tela antiga',async()=>{
+ const first=await approved();
+ await repo.add([example({fonte:'manual',link_original:'https://example.org/second',link_afiliado:'https://example.org/second-aff',titulo:'Segunda oferta'})]);
+ let second=(await repo.list()).find(o=>o.id!==first.id);await repo.edit({id:second.id,version:second.version,action:'aprovar'});second=(await repo.list()).find(o=>o.id===second.id);
+ const sent=[];const service=createService(repo,env,async(url,opts)=>{sent.push(JSON.parse(opts.body));return {ok:true,json:async()=>({ok:true,result:{message_id:888}})};});const session=await login(service);
+ await assert.rejects(()=>service.run(request('publish',{},session)),e=>e.status===400);
+ await assert.rejects(()=>service.run(request('publish',{id:second.id,version:second.version-1},session)),e=>e.status===409);
+ const r=await service.run(request('publish',{id:second.id,version:second.version},session));assert.equal(r.data.id,second.id);assert.match(sent[0].text,/Segunda oferta/);assert.equal((await repo.list()).find(o=>o.id===first.id).estado,'aprovado');
+ await assert.rejects(()=>service.run(request('publish',{id:second.id,version:second.version},session)),e=>e.status===409);assert.equal(sent.length,1);
+});
+
+test('paginação alcança registros além de mil e conta todos os estados',async()=>{
+ await pg.query("INSERT INTO pc_offers(id,data,state,updated) SELECT 'page-'||g,'{}'::jsonb,CASE WHEN g<=1000 THEN 'descartado' ELSE 'pendente' END,now() FROM generate_series(1,1045) g");
+ const page1=await repo.page();assert.equal(page1.total,45);assert.equal(page1.offers.length,20);assert.equal(page1.pages,3);assert.equal(page1.counts.descartado,1000);
+ const page2=await repo.page({page:'2'}),last=await repo.page({page:'999'});assert.equal(last.page,3);assert.equal(last.offers.length,5);assert.equal(new Set([...page1.offers,...page2.offers,...last.offers].map(o=>o.id)).size,45);
+ const discarded=await repo.page({filter:'descartado',page:'50'});assert.equal(discarded.total,1000);assert.equal(discarded.offers.length,20);
+ await assert.rejects(()=>repo.page({filter:'invalid'}));await assert.rejects(()=>repo.page({page:'0'}));
+});
+
+test('deduplica anúncio entre coleta ML e cadastro manual sem juntar títulos iguais',async()=>{
+ await repo.add([example({fonte:'mercado_livre',external_id:'MLB123',link_original:'https://produto.mercadolivre.com.br/MLB-123'})]);
+ assert.equal(await repo.add([example({fonte:'manual',link_original:'https://produto.mercadolivre.com.br/MLB-123-tenis?utm_source=x'})]),0);
+ assert.equal(await repo.add([example({fonte:'manual',link_original:'https://produto.mercadolivre.com.br/MLB-456-tenis'})]),1);
+ assert.equal(await repo.add([example({fonte:'manual',link_original:'https://evil.example/MLB-123'})]),1);
+});
+
+test('link afiliado idêntico reconhece oferta entre origens',async()=>{
+ await repo.add([example({link_afiliado:'https://meli.la/abc'})]);
+ assert.equal(await repo.add([example({fonte:'manual',link_original:'https://meli.la/abc',link_afiliado:'https://meli.la/abc'})]),0);
+});
+
+test('importação publicada impede reenvio sem apagar edições',async()=>{
+ const o=await approved();assert.equal(await repo.add([example({fonte:'manual',publicado:true,titulo:'Título antigo'})],true),0);
+ const saved=(await repo.list())[0];assert.equal(saved.estado,'publicado');assert.equal(saved.titulo,o.titulo);assert.equal(await repo.claim(),null);
+});
+
+test('duplicata histórica publicada bloqueia envio de outro registro',async()=>{
+ const o=await approved();const data={...o,link_original:'https://example.org/different-original'};
+ await pg.query("INSERT INTO pc_offers(id,data,state) VALUES('historical',$1,'publicado')",[JSON.stringify(data)]);
+ await assert.rejects(()=>repo.claim({id:o.id,version:o.version}),/já possui/);assert.equal((await repo.list()).find(x=>x.id===o.id).estado,'aprovado');
+});
+
+test('login informa configuração de coleta e publicação',async()=>{
+ const service=createService(repo,{...env,CRON_SECRET:'x'.repeat(32)});const r=await service.run(request('login',{password:env.ADMIN_PASSWORD}));assert.equal(r.data.coleta_diaria,true);assert.equal(r.data.publicacao_habilitada,true);
+});
+
+
+test('importação não altera envio em conferência',async()=>{
+ const o=await approved();await repo.claim({id:o.id,version:o.version});
+ await assert.rejects(()=>repo.add([example({fonte:'manual',publicado:true})],true),/conferência/);
+ assert.equal((await repo.list())[0].estado,'enviando');
+});
+
+test('lista paginada exige sessão e aplica filtro no servidor',async()=>{
+ await approved();const service=createService(repo,env);await assert.rejects(()=>service.run(request('offers-page')),e=>e.status===401);
+ const session=await login(service),req=request('offers-page',undefined,session);req.query.filter='descartado';req.query.page='1';
+ const data=(await service.run(req)).data;assert.equal(data.total,0);assert.equal(data.counts.aprovado,1);assert.deepEqual(data.offers,[]);
+});
