@@ -130,3 +130,37 @@ test('lista paginada exige sessão e aplica filtro no servidor',async()=>{
  const session=await login(service),req=request('offers-page',undefined,session);req.query.filter='descartado';req.query.page='1';
  const data=(await service.run(req)).data;assert.equal(data.total,0);assert.equal(data.counts.aprovado,1);assert.deepEqual(data.offers,[]);
 });
+
+
+test('período inclui o dia final de Brasília e respeita estado, totais e ordenação',async()=>{
+ for(let i=0;i<4;i++)await repo.add([example({link_original:`https://example.org/date/${i}`})]);
+ const rows=await repo.list();const dates=['2026-10-17T02:59:59Z','2026-10-17T03:00:00Z','2026-10-18T02:59:59Z','2026-10-18T03:00:00Z'];
+ for(let i=0;i<4;i++)await pg.query('UPDATE pc_offers SET created_at=$2,updated=$2 WHERE id=$1',[rows[i].id,dates[i]]);
+ const page=await repo.page({dateBy:'created',from:'2026-10-17',to:'2026-10-17'});
+ assert.equal(page.total,2);assert.equal(page.counts.pendente,2);assert.deepEqual(page.offers.map(o=>o.id),[rows[2].id,rows[1].id]);
+ assert.deepEqual((await repo.page({dateBy:'created',from:'2026-10-17',to:'2026-10-17',order:'asc'})).offers.map(o=>o.id),[rows[1].id,rows[2].id]);
+ assert.equal((await repo.page({filter:'publicado',from:'2026-10-17',to:'2026-10-17'})).total,0);
+ for(const options of [{from:'2026-02-30'},{from:'2026-10-18',to:'2026-10-17'},{dateBy:'constructor'},{order:'desc;DROP TABLE pc_offers'}])await assert.rejects(()=>repo.page(options));
+});
+test('entrada permanece estável após edição e publicação tem data independente',async()=>{
+ const o=await approved();const created=o.criado_em;await repo.edit({id:o.id,version:o.version,action:'aprovar'});
+ assert.deepEqual((await repo.list())[0].criado_em,created);
+ const claimed=await repo.claim();await repo.finish(claimed,{estado:'publicado',message_id:42});const sent=(await repo.list())[0];assert.ok(sent.publicado_em);
+ await pg.query("UPDATE pc_offers SET updated=now()+interval '2 days'");assert.deepEqual((await repo.list())[0].publicado_em,sent.publicado_em);
+ assert.equal((await repo.page({dateBy:'published'})).offers[0].id,o.id);
+});
+test('conferência no canal registra confirmação sem inventar horário de publicação',async()=>{
+ await approved();const o=await repo.claim();await repo.finish(o,{estado:'incerto'});await pg.query("UPDATE pc_offers SET claimed_at=now()-interval '6 minutes'");
+ await repo.reconcile({id:o.id,publicado:true,conferido_no_canal:true});const row=(await repo.list())[0];assert.ok(row.confirmado_em);assert.equal(row.publicado_em,null);
+ assert.equal((await repo.page({dateBy:'published',from:'2000-01-01'})).total,0);
+});
+test('preço longo é rejeitado sem truncar ou alterar aprovação',async()=>{
+ const o=await approved();await assert.rejects(()=>repo.edit({id:o.id,version:o.version,preco:'1'.repeat(101),action:'aprovar'}),/100 caracteres/);
+ assert.equal((await repo.list())[0].version,o.version);assert.equal((await repo.list())[0].preco,o.preco);
+ assert.throws(()=>normalize(example({preco:'1'.repeat(101)})),/100 caracteres/);
+});
+test('API encaminha período e ordenação para a consulta autenticada',async()=>{
+ await repo.add([example()]);await pg.query("UPDATE pc_offers SET updated='2026-10-17T03:00:00Z'");const service=createService(repo,env),s=await login(service);
+ const req=request('offers-page',undefined,s);req.query={op:'offers-page',dateBy:'updated',from:'2026-10-18',to:'2026-10-18',order:'asc'};
+ assert.equal((await service.run(req)).data.total,0);req.query.from='2026-10-17';assert.equal((await service.run(req)).data.total,1);
+});
