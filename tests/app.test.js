@@ -164,3 +164,16 @@ test('API encaminha período e ordenação para a consulta autenticada',async()=
  const req=request('offers-page',undefined,s);req.query={op:'offers-page',dateBy:'updated',from:'2026-10-18',to:'2026-10-18',order:'asc'};
  assert.equal((await service.run(req)).data.total,0);req.query.from='2026-10-17';assert.equal((await service.run(req)).data.total,1);
 });
+
+test('formata postagem com destaque para produto e preço sem inventar urgência',()=>{
+ const text=formatPost(example({link_afiliado:'https://example.org/a',loja:'Loja <teste>',review:'Produto leve & resistente'}));
+ assert.match(text,/🚨 <b>OFERTA EM DESTAQUE<\/b> 🚨/);assert.match(text,/🛍️ <b>Tênis &lt;Teste&gt; &amp; corrida<\/b>/);assert.match(text,/💥 <b>POR APENAS R\$ 100,00<\/b> 🔥/);assert.match(text,/🏪 <b>Loja:<\/b> Loja &lt;teste&gt;/);assert.match(text,/✨ Produto leve &amp; resistente/);assert.match(text,/🛒 <a href="https:\/\/example.org\/a"><b>QUERO APROVEITAR<\/b><\/a>/);assert.doesNotMatch(text,/oferta por tempo limitado/i);
+});
+test('foto recusada pelo Telegram envia uma única postagem de texto e avisa o painel',async()=>{
+ const calls=[];const r=await telegram(example({imagem:'https://example.org/foto.jpg',link_afiliado:'https://example.org/a'}),env,async(url,opts)=>{calls.push({url,payload:JSON.parse(opts.body)});if(calls.length===1)return {ok:false,status:400,json:async()=>({ok:false,description:'Bad Request: failed to get HTTP URL content'})};return {ok:true,status:200,json:async()=>({ok:true,result:{message_id:321}})};});
+ assert.equal(r.estado,'publicado');assert.equal(r.message_id,321);assert.match(r.aviso,/somente com texto/);assert.equal(calls.length,2);assert.match(calls[0].url,/sendPhoto$/);assert.match(calls[1].url,/sendMessage$/);assert.equal(calls[1].payload.photo,undefined);
+});
+test('erros do Telegram orientam a correção sem expor a resposta do provedor',async()=>{
+ const r=await telegram(example({link_afiliado:'https://example.org/a'}),env,async()=>({ok:false,status:403,json:async()=>({ok:false,description:'secret telegram detail'})}));
+ assert.equal(r.estado,'erro');assert.match(r.erro,/administrador/);assert.doesNotMatch(r.erro,/secret/);
+});
